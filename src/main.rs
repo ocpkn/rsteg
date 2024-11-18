@@ -1,48 +1,56 @@
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
-use std::cmp::min;
 
-use clap::{ Parser, Subcommand, ValueEnum };
+use clap::Parser;
 
 use rand::Rng;
 use rand::SeedableRng;
-use rand_chacha::ChaCha8Rng;
+use rand_chacha::ChaCha20Rng;
+
+// TODO support alpha channels
+// TODO add histogram equalization and stretching
+// TODO support text instead of images?
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[command(subcommand)]
-    command: Option<Commands>,
-
-    #[arg(short, long, value_name="1..8", value_parser=clap::value_parser!(u8).range(1..8), default_value="2")]
-    bits: u8,
-
-    #[arg(value_enum, short, long)]
-    normalize: Option<NormalTypes>,
-
-    #[arg(short, long, value_name="KEY", conflicts_with="unscramble")]
-    scramble: Option<u64>,
-
-    #[arg(short, long, value_name="KEY")]
-    unscramble: Option<u64>,
-
     input: PathBuf,
 
+    #[arg(short, long, default_value("out.png"))]
     output: PathBuf,
-}
 
-#[derive(Subcommand, Debug)]
-enum Commands {
-    Hide {
-        image: PathBuf,
-    },
-    Reveal,
-}
+    #[arg(short, long,
+        group="mode",
+        requires("bits"))]
+    reveal: bool,
 
-#[derive(ValueEnum, Debug, Clone)]
-enum NormalTypes {
-    Stretch,
-    Equalize,
+    #[arg(short, long,
+        group="mode",
+        requires("bits"),
+        requires("image"))]
+    conceal: bool,
+
+    #[arg(short, long,
+        requires("conceal"))]
+    image: Option<PathBuf>,
+
+    #[arg(short, long,
+        group="mode",
+        requires("key"))]
+    encrypt: bool,
+
+    #[arg(short, long,
+        group="mode",
+        requires("key"))]
+    decrypt: bool,
+
+    #[arg(short, long, value_name="KEY",
+        requires("mode"))]
+    key: Option<u64>,
+
+    #[arg(short, long, value_name="1-8", value_parser=clap::value_parser!(u8).range(1..9),
+        default_value("8"))]
+    bits: u8,
 }
 
 fn decode_image(path: PathBuf, normalize: bool) -> (png::OutputInfo, Vec<u8>) {
@@ -62,91 +70,73 @@ fn decode_image(path: PathBuf, normalize: bool) -> (png::OutputInfo, Vec<u8>) {
 fn main() {
     let args = Args::parse();
 
-    let (info, mut buf) = decode_image(args.input, true);
+    let (info, buf) = decode_image(args.input, true);
 
-    let alpha = (info.color_type as usize & 4) >> 2;
-    let samples = info.color_type.samples();
+    let alpha: usize = (info.color_type as usize & 4) >> 2;
+    let samples: usize = info.color_type.samples();
 
     assert!(samples - alpha == 3);
 
-    if let Some(key) = args.scramble {
-        let mut rng = ChaCha8Rng::seed_from_u64(key);
-
-        let color_samples = (samples - alpha) as usize;
-        let len: usize = (info.width * info.height * (color_samples as u32)) as usize;
-        let nums: Vec<usize> = (1..len).rev().map(|i| rng.gen_range(0..i + 1)).collect();
-
-        let f = |i| i + ((alpha * i) / color_samples);
-
-        for i in (1..len).rev() {
-            buf.swap(f(i), f(nums[i-1]));
-        }
-    }
-
-    let mut out_buf: Vec<u8> = match args.command {
-        None => {
-            buf.chunks_exact(samples).flat_map(|pixel|
-                pixel.iter().take(samples - alpha).map(|v| *v)
-            ).collect()
-        },
-        // TODO fix for input grayscale
-        Some(Commands::Hide { image: hidden }) => {
-            // Decode hidden image
-            let (h_info, h_buf) = decode_image(hidden, true);
-
-            // Exit if hidden image is too large
-            if h_info.width != info.width || h_info.height != info.height {
-                eprintln!("Hidden image dimensions do not match input");
-                std::process::exit(-1);
+    // Remove alpha channel
+    let mut input: Vec<u8> = buf.chunks_exact(samples).flat_map(
+        |p| p.iter().take(samples - alpha).map(|x|
+            if args.reveal {
+                *x
+            } else {
+                x >> (8 - args.bits)
             }
+        )
+    ).collect();
 
-            let mask = 0xFF << args.bits;
+    // Encrypt/Decrypt
+    if let Some(key) = args.key {
+        let mut rng = ChaCha20Rng::seed_from_u64(key);
 
-            let h_alpha = (h_info.color_type as usize & 4) >> 2;
-            let h_samples = h_info.color_type.samples();
+        let max: u16 = 1 << (args.bits);
 
-            assert!(h_samples - h_alpha == 3);
-
-            let row_iter = buf.chunks_exact(info.line_size);
-            let h_row_iter = h_buf.chunks_exact(h_info.line_size);
-
-            h_row_iter.zip(row_iter).flat_map(|(h_row, row)| {
-                let h_pixel_iter = h_row.chunks_exact(h_samples);
-                let pixel_iter = row.chunks_exact(samples);
-
-                h_pixel_iter.zip(pixel_iter).flat_map(|(h_pixel, pixel)| {
-                    (0..h_samples - h_alpha).map(|i| {
-                        let h_color = h_pixel[min(h_samples-1-h_alpha, i)];
-                        let color = pixel[min(samples-1-alpha, i)];
-                        (h_color & mask) | (color >> (8 - args.bits))
-                    })
-                })
-            }).collect()
-        },
-        Some(Commands::Reveal) => {
-            let mask = 0xFF >> (8 - args.bits);
-
-            let max_in = (1 << args.bits) - 1;
-            let max_out = 0xFF;
-
-            buf.chunks_exact(samples).flat_map(|pixel| {
-                pixel.iter().map(|color| {
-                    let input = (color & mask) as u16;
-                    (input * max_out / max_in) as u8
-                })
-            }).collect()
-        },
-    };
-
-    if let Some(key) = args.unscramble {
-        let mut rng = ChaCha8Rng::seed_from_u64(key);
-
-        let nums: Vec<usize> = (1..out_buf.len()).rev().map(|i| rng.gen_range(0..i + 1)).collect();
-
-        for i in 1..out_buf.len() {
-            out_buf.swap(i, nums[i - 1]);
+        for x in input.iter_mut() {
+            let rand = rng.gen_range(0..max);
+            let num = if args.decrypt || args.reveal {max - rand} else {rand};
+            let y = *x as u16 + num;
+            *x = (y % max) as u8;
         }
     }
+
+    let out_buf: Vec<u8> = if let Some(image) = args.image {
+        // Decode hidden image
+        let (i_info, i_buf) = decode_image(image, true);
+
+        // Exit if hidden image is too large
+        if i_info.width != info.width || i_info.height != info.height {
+            eprintln!("Image dimensions do not match");
+            std::process::exit(-1);
+        }
+
+        let mask = u8::MAX << args.bits;
+
+        let i_alpha: usize = (i_info.color_type as usize & 4) >> 2;
+        let i_samples: usize = i_info.color_type.samples();
+
+        assert!(i_samples - i_alpha == samples - alpha);
+
+        let px_iter = input.chunks_exact(samples - alpha);
+        let i_px_iter = i_buf.chunks_exact(i_samples);
+
+        i_px_iter.zip(px_iter).flat_map(|(i_px, px)| {
+            (0..i_samples - i_alpha).map(|i| {
+                (i_px[i] & mask) | px[i]
+            })
+        }).collect()
+    } else {
+        let max_out: u8 = u8::MAX;
+        let mask: u8 = max_out >> (8 - args.bits);
+
+        input.chunks_exact(samples).flat_map(|p| {
+            p.iter().map(|color| {
+                ((color & mask) as u16 * max_out as u16 / mask as u16) as u8
+            })
+        }).collect()
+    };
 
     let file = File::create(args.output).unwrap();
     let ref mut w = BufWriter::new(file);
