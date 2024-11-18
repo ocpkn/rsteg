@@ -11,9 +11,9 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 // TODO support alpha channels
-// TODO add histogram equalization and stretching
 // TODO support text instead of images?
 
+// CLI arg definition
 #[derive(Parser, Debug)]
 struct Args {
     input: PathBuf,
@@ -53,6 +53,7 @@ struct Args {
     equalize: bool,
 }
 
+// TODO return dimensions and samples, write function to remove alpha channel
 fn decode_image(path: PathBuf, normalize: bool) -> (png::OutputInfo, Vec<u8>) {
     let mut decoder = png::Decoder::new(File::open(path).expect("Input file not found"));
 
@@ -90,6 +91,7 @@ fn main() {
 
     let samples = samples - alpha;
 
+    // Contrast stretching algorithm for normalization
     if args.stretch {
         let maxx: u8 = u8::MAX >> (8 - args.bits);
 
@@ -107,18 +109,25 @@ fn main() {
                 *y = new as u8;
             }
         }
-    } else if args.equalize {
+    }
+
+    // Histogram equalization algorithm, normalizes HSV value
+    else if args.equalize {
+        // Convert image to HSV color
         let hsvinput: Vec<HSVColor> = input.chunks_exact(samples).map(|px| {
             let (r, g, b) = (px[0], px[1], px[2]);
             HSVColor::from_rgb(r, g, b, args.bits)
         }).collect();
 
+        // Create a sorted vector of unique values for the CDF
         let mut vals: Vec<f32> = hsvinput.iter().map(|hsv| hsv.val).collect();
-        vals.sort_by(|a, b| a.partial_cmp(&b).unwrap());
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
         vals.dedup();
 
+        // Define the CDF with range [0, 1]
         let cdf = |v| vals.binary_search_by(|a| a.partial_cmp(&v).unwrap()).unwrap() as f32 / (vals.len() - 1) as f32;
 
+        // Equalize and convert back to RGB
         input = hsvinput.iter().flat_map(|hsv| {
             HSVColor {
                 hue: hsv.hue,
@@ -128,17 +137,20 @@ fn main() {
         }).collect();
     }
 
-    // Encrypt/Decrypt
+    // Encryption/decryption using a stream cipher
     if let Some(key) = args.key {
+        // Seed PRNG with key
         let mut rng = ChaCha20Rng::seed_from_u64(key);
 
         let max: u8 = u8::MAX >> (8 - args.bits);
 
+        // XOR each pixel with the stream
         for x in input.iter_mut() {
             *x ^= rng.gen_range(0..=max);
         }
     }
 
+    // Concealing an image in another
     let out_buf: Vec<u8> = if let Some(image) = args.image {
         // Decode hidden image
         let (i_info, i_buf) = decode_image(image, true);

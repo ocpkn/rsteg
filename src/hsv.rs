@@ -7,7 +7,7 @@ pub struct HSVColor {
 
 impl HSVColor {
     pub fn from_rgb<T: Into<f32>>(red: T, green: T, blue: T, depth: u8) -> Self {
-        let n: f32 = ((1 << depth as u8) - 1) as f32;
+        let n: f32 = ((1 << depth) - 1) as f32;
         let (r, g, b) = (red.into() / n, green.into() / n, blue.into() / n);
 
         let v: f32 = r.max(g.max(b));
@@ -48,7 +48,7 @@ impl HSVColor {
             _ => unreachable!()
         };
 
-        let n = ((1 << depth as u8) - 1) as f32;
+        let n = ((1 << depth) - 1) as f32;
         let r = ((r1 + m) * n) as u8;
         let g = ((g1 + m) * n) as u8;
         let b = ((b1 + m) * n) as u8;
