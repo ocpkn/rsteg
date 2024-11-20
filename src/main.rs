@@ -13,6 +13,14 @@ use rand_chacha::ChaCha20Rng;
 // TODO support alpha channels
 // TODO support text instead of images?
 
+/*
+spec, or: how are we gonna deal with alpha channels
+cases for hide:
+- input has alpha/input doesn't have alpha
+- conceal has alpha/conceal doesn't have alpha
+- encrypted/not encrypted
+*/
+
 // CLI arg definition
 #[derive(Parser, Debug)]
 struct Args {
@@ -28,16 +36,10 @@ struct Args {
 
     #[arg(short, long,
         group="mode",
-        requires("bits"),
-        requires("image"))]
-    conceal: bool,
+        requires("bits"))]
+    conceal: Option<PathBuf>,
 
-    #[arg(short, long,
-        requires("conceal"))]
-    image: Option<PathBuf>,
-
-    #[arg(short, long, value_name="KEY",
-        requires("mode"))]
+    #[arg(short, long, value_name="KEY")]
     key: Option<u64>,
 
     #[arg(short, long, value_name="1-8", value_parser=clap::value_parser!(u8).range(1..9),
@@ -68,45 +70,52 @@ fn decode_image(path: PathBuf, normalize: bool) -> (png::OutputInfo, Vec<u8>) {
     (info, buf)
 }
 
+fn strip_alpha(info: &png::OutputInfo, buf: &mut [u8]) {
+    
+}
+
 fn main() {
     let args = Args::parse();
 
-    let (info, buf) = decode_image(args.input, true);
+    let (mut info, mut buf) = decode_image(args.input, true);
 
     let alpha: usize = (info.color_type as usize & 4) >> 2;
     let samples: usize = info.color_type.samples();
 
-    assert!(samples - alpha == 3);
-
-    // Remove alpha channel
-    let mut input: Vec<u8> = buf.chunks_exact(samples).flat_map(
-        |p| p.iter().take(samples - alpha).map(|x|
-            if args.reveal {
-                *x
-            } else {
-                x >> (8 - args.bits)
+    if args.reveal {
+        /*
+        for p in buf.chunks_exact_mut(samples) {
+            if let Some(last) = p.last_mut() {
+                *last = u8::MAX;
             }
-        )
-    ).collect();
-
-    let samples = samples - alpha;
+        }
+        */
+    } else {
+        for p in buf.chunks_exact_mut(samples) {
+            for c in p.iter_mut().take(samples-alpha) {
+                *c >>= 8 - args.bits;
+            }
+        }
+    }
 
     // Contrast stretching algorithm for normalization
     if args.stretch {
         let maxx: u8 = u8::MAX >> (8 - args.bits);
 
-        let minmaxs = input.chunks_exact(samples).fold(vec![(maxx, 0u8); samples],
-            |minmaxs, x| {
-                let b = x.iter().zip(minmaxs);
-
-                b.map(|(x, (min, max))| (min.min(*x), max.max(*x))).collect()
+        let minmaxs = buf.chunks_exact(samples).fold(
+            vec![(maxx, 0u8); samples-alpha],
+            |minmaxs, p| {
+                let b = p.iter().take(samples-alpha).zip(minmaxs);
+                b.map(|(p, (min, max))| (min.min(*p), max.max(*p))).collect()
             }
         );
 
-        for x in input.chunks_exact_mut(samples) {
-            for (y, (min, max)) in x.iter_mut().zip(minmaxs.iter()) {
-                let new = if *max == 0 {0} else {(*y - *min) as u16 * maxx as u16 / (*max - *min) as u16};
-                *y = new as u8;
+        for p in buf.chunks_exact_mut(samples) {
+            for (c, (min, max)) in p.iter_mut()
+                                    .zip(minmaxs.iter()) {
+                let new = if *max == 0 {0}
+                else {(*c - *min) as u16 * maxx as u16 / (*max - *min) as u16};
+                *c = new as u8;
             }
         }
     }
@@ -114,27 +123,33 @@ fn main() {
     // Histogram equalization algorithm, normalizes HSV value
     else if args.equalize {
         // Convert image to HSV color
-        let hsvinput: Vec<HSVColor> = input.chunks_exact(samples).map(|px| {
-            let (r, g, b) = (px[0], px[1], px[2]);
-            HSVColor::from_rgb(r, g, b, args.bits)
-        }).collect();
+        let mut hsvs: Vec<HSVColor> = if samples-alpha == 3 {
+            buf.chunks_exact(samples).map(|p| {
+                HSVColor::from_rgb(p[0], p[1], p[2], args.bits)
+            }).collect()
+        } else {
+            buf.chunks_exact(samples).map(|p| {
+                HSVColor::from_rgb(p[0], p[0], p[0], args.bits)
+            }).collect()
+        };
 
         // Create a sorted vector of unique values for the CDF
-        let mut vals: Vec<f32> = hsvinput.iter().map(|hsv| hsv.val).collect();
+        let mut vals: Vec<f32> = hsvs.iter().map(|hsv| hsv.val).collect();
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
         vals.dedup();
 
         // Define the CDF with range [0, 1]
-        let cdf = |v| vals.binary_search_by(|a| a.partial_cmp(&v).unwrap()).unwrap() as f32 / (vals.len() - 1) as f32;
+        let cdf = |v| vals.binary_search_by(|a|
+            a.partial_cmp(&v).unwrap()
+        ).unwrap() as f32 / (vals.len() - 1) as f32;
 
         // Equalize and convert back to RGB
-        input = hsvinput.iter().flat_map(|hsv| {
-            HSVColor {
-                hue: hsv.hue,
-                sat: hsv.sat,
-                val: cdf(hsv.val)
-            }.to_rgb(args.bits)
-        }).collect();
+        for (p, hsv) in buf.chunks_exact_mut(samples).zip(hsvs.iter_mut()) {
+            hsv.val = cdf(hsv.val);
+            for (c, new) in p.iter_mut().zip(hsv.to_rgb(args.bits)) {
+                *c = new;
+            }
+        }
     }
 
     // Encryption/decryption using a stream cipher
@@ -145,15 +160,18 @@ fn main() {
         let max: u8 = u8::MAX >> (8 - args.bits);
 
         // XOR each pixel with the stream
-        for x in input.iter_mut() {
+        for x in buf.iter_mut() {
             *x ^= rng.gen_range(0..=max);
         }
     }
 
     // Concealing an image in another
-    let out_buf: Vec<u8> = if let Some(image) = args.image {
+    if let Some(image) = args.conceal {
         // Decode hidden image
-        let (i_info, i_buf) = decode_image(image, true);
+        let (i_info, mut i_buf) = decode_image(image, true);
+
+        let i_alpha: usize = (i_info.color_type as usize & 4) >> 2;
+        let i_samples: usize = i_info.color_type.samples();
 
         // Exit if hidden image is too large
         if i_info.width != info.width || i_info.height != info.height {
@@ -161,40 +179,40 @@ fn main() {
             std::process::exit(-1);
         }
 
+        assert!(i_samples-i_alpha == samples-alpha);
+
         let mask = u8::MAX << args.bits;
 
-        let i_alpha: usize = (i_info.color_type as usize & 4) >> 2;
-        let i_samples: usize = i_info.color_type.samples();
+        let iter = buf.chunks_exact(samples);
+        let i_iter = i_buf.chunks_exact_mut(i_samples);
 
-        assert!(i_samples - i_alpha == samples);
+        for (i_p, p) in i_iter.zip(iter) {
+            for (i_c, c) in i_p.iter_mut().zip(p) {
+                *i_c = (*i_c & mask) | c;
+            }
+        }
 
-        let px_iter = input.chunks_exact(samples);
-        let i_px_iter = i_buf.chunks_exact(i_samples);
-
-        i_px_iter.zip(px_iter).flat_map(|(i_px, px)| {
-            (0..samples).map(|i| {
-                (i_px[i] & mask) | px[i]
-            })
-        }).collect()
+        buf = i_buf;
+        info = i_info;
     } else {
         let max_out: u8 = u8::MAX;
         let mask: u8 = max_out >> (8 - args.bits);
 
-        input.chunks_exact(samples).flat_map(|p| {
-            p.iter().map(|color| {
-                ((color & mask) as u16 * max_out as u16 / mask as u16) as u8
-            })
-        }).collect()
+        for p in buf.chunks_exact_mut(samples) {
+            for c in p.iter_mut() {
+                *c = ((*c & mask) as u16 * max_out as u16 / mask as u16) as u8;
+            }
+        }
     };
 
     let file = File::create(args.output).unwrap();
     let w = &mut BufWriter::new(file);
 
     let mut encoder = png::Encoder::new(w, info.width, info.height);
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_color(info.color_type);
+    encoder.set_depth(info.bit_depth);
 
     let mut writer = encoder.write_header().unwrap();
 
-    writer.write_image_data(&out_buf).unwrap();
+    writer.write_image_data(&buf).unwrap();
 }
