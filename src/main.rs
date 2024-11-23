@@ -10,9 +10,6 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-// TODO support alpha channels
-// TODO support text instead of images?
-
 /*
 spec, or: how are we gonna deal with alpha channels
 cases for hide:
@@ -56,6 +53,36 @@ struct Args {
 }
 
 // TODO return dimensions and samples, write function to remove alpha channel
+fn read_image(path: PathBuf) -> (u32, u32, Vec<u8>) {
+    let mut decoder = png::Decoder::new(File::open(path).expect("Input file not found"));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().expect("Image info failed to read");
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("Image data failed to read");
+    let samples = info.color_type.samples();
+
+    (info.width, info.height, buf.chunks_exact(samples).flat_map(|s|
+        match s.len() {
+            1 => [s[0], s[0], s[0]],
+            2 => {
+                let a = s[1] as u16;
+                let g = (a * s[0] as u16 / 0xFF) as u8;
+                [g, g, g]
+            },
+            3 => [s[0], s[1], s[2]],
+            4 => {
+                let a = s[3] as u16;
+                let r = (a * s[0] as u16 / 0xFF) as u8;
+                let g = (a * s[1] as u16 / 0xFF) as u8;
+                let b = (a * s[2] as u16 / 0xFF) as u8;
+                [r, g, b]
+            },
+            _ => panic!(),
+        }
+    ).collect())
+}
+
+#[allow(dead_code)]
 fn decode_image(path: PathBuf, normalize: bool) -> (png::OutputInfo, Vec<u8>) {
     let mut decoder = png::Decoder::new(File::open(path).expect("Input file not found"));
 
@@ -70,31 +97,14 @@ fn decode_image(path: PathBuf, normalize: bool) -> (png::OutputInfo, Vec<u8>) {
     (info, buf)
 }
 
-fn strip_alpha(info: &png::OutputInfo, buf: &mut [u8]) {
-    
-}
-
 fn main() {
     let args = Args::parse();
 
-    let (mut info, mut buf) = decode_image(args.input, true);
+    let (width, height, mut buf) = read_image(args.input);
 
-    let alpha: usize = (info.color_type as usize & 4) >> 2;
-    let samples: usize = info.color_type.samples();
-
-    if args.reveal {
-        /*
-        for p in buf.chunks_exact_mut(samples) {
-            if let Some(last) = p.last_mut() {
-                *last = u8::MAX;
-            }
-        }
-        */
-    } else {
-        for p in buf.chunks_exact_mut(samples) {
-            for c in p.iter_mut().take(samples-alpha) {
-                *c >>= 8 - args.bits;
-            }
+    if !args.reveal {
+        for c in buf.iter_mut() {
+            *c >>= 8 - args.bits;
         }
     }
 
@@ -102,15 +112,15 @@ fn main() {
     if args.stretch {
         let maxx: u8 = u8::MAX >> (8 - args.bits);
 
-        let minmaxs = buf.chunks_exact(samples).fold(
-            vec![(maxx, 0u8); samples-alpha],
+        let minmaxs = buf.chunks_exact(3).fold(
+            vec![(maxx, 0u8); 3],
             |minmaxs, p| {
-                let b = p.iter().take(samples-alpha).zip(minmaxs);
+                let b = p.iter().zip(minmaxs);
                 b.map(|(p, (min, max))| (min.min(*p), max.max(*p))).collect()
             }
         );
 
-        for p in buf.chunks_exact_mut(samples) {
+        for p in buf.chunks_exact_mut(3) {
             for (c, (min, max)) in p.iter_mut()
                                     .zip(minmaxs.iter()) {
                 let new = if *max == 0 {0}
@@ -123,15 +133,10 @@ fn main() {
     // Histogram equalization algorithm, normalizes HSV value
     else if args.equalize {
         // Convert image to HSV color
-        let mut hsvs: Vec<HSVColor> = if samples-alpha == 3 {
-            buf.chunks_exact(samples).map(|p| {
+        let mut hsvs: Vec<HSVColor> = 
+            buf.chunks_exact(3).map(|p| {
                 HSVColor::from_rgb(p[0], p[1], p[2], args.bits)
-            }).collect()
-        } else {
-            buf.chunks_exact(samples).map(|p| {
-                HSVColor::from_rgb(p[0], p[0], p[0], args.bits)
-            }).collect()
-        };
+            }).collect();
 
         // Create a sorted vector of unique values for the CDF
         let mut vals: Vec<f32> = hsvs.iter().map(|hsv| hsv.val).collect();
@@ -144,7 +149,7 @@ fn main() {
         ).unwrap() as f32 / (vals.len() - 1) as f32;
 
         // Equalize and convert back to RGB
-        for (p, hsv) in buf.chunks_exact_mut(samples).zip(hsvs.iter_mut()) {
+        for (p, hsv) in buf.chunks_exact_mut(3).zip(hsvs.iter_mut()) {
             hsv.val = cdf(hsv.val);
             for (c, new) in p.iter_mut().zip(hsv.to_rgb(args.bits)) {
                 *c = new;
@@ -168,49 +173,35 @@ fn main() {
     // Concealing an image in another
     if let Some(image) = args.conceal {
         // Decode hidden image
-        let (i_info, mut i_buf) = decode_image(image, true);
-
-        let i_alpha: usize = (i_info.color_type as usize & 4) >> 2;
-        let i_samples: usize = i_info.color_type.samples();
+        let (i_width, i_height, i_buf) = read_image(image);
 
         // Exit if hidden image is too large
-        if i_info.width != info.width || i_info.height != info.height {
+        if i_width != width || i_height != height {
             eprintln!("Image dimensions do not match");
             std::process::exit(-1);
         }
 
-        assert!(i_samples-i_alpha == samples-alpha);
-
         let mask = u8::MAX << args.bits;
 
-        let iter = buf.chunks_exact(samples);
-        let i_iter = i_buf.chunks_exact_mut(i_samples);
-
-        for (i_p, p) in i_iter.zip(iter) {
-            for (i_c, c) in i_p.iter_mut().zip(p) {
-                *i_c = (*i_c & mask) | c;
-            }
+        for (c, i_c) in buf.iter_mut().zip(i_buf.iter()) {
+            *c = (*i_c & mask) | *c;
         }
 
-        buf = i_buf;
-        info = i_info;
     } else {
-        let max_out: u8 = u8::MAX;
-        let mask: u8 = max_out >> (8 - args.bits);
+        let max_out = u8::MAX;
+        let mask = max_out >> (8 - args.bits);
 
-        for p in buf.chunks_exact_mut(samples) {
-            for c in p.iter_mut() {
-                *c = ((*c & mask) as u16 * max_out as u16 / mask as u16) as u8;
-            }
+        for c in buf.iter_mut() {
+            *c = ((*c & mask) as u16 * max_out as u16 / mask as u16) as u8;
         }
     };
 
     let file = File::create(args.output).unwrap();
     let w = &mut BufWriter::new(file);
 
-    let mut encoder = png::Encoder::new(w, info.width, info.height);
-    encoder.set_color(info.color_type);
-    encoder.set_depth(info.bit_depth);
+    let mut encoder = png::Encoder::new(w, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
 
     let mut writer = encoder.write_header().unwrap();
 
