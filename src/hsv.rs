@@ -6,8 +6,8 @@ pub struct HSVColor {
 }
 
 impl HSVColor {
-    pub fn from_rgb<T: Into<f32>>(red: T, green: T, blue: T, depth: u8) -> Self {
-        let n: f32 = ((1 << depth) - 1) as f32;
+    pub fn from_rgb<T: Into<f32>>(red: T, green: T, blue: T) -> Self {
+        let n: f32 = u8::MAX as f32;
         let (r, g, b) = (red.into() / n, green.into() / n, blue.into() / n);
 
         let v: f32 = r.max(g.max(b));
@@ -32,7 +32,7 @@ impl HSVColor {
         HSVColor { hue: h, sat: s, val: v }
     }
 
-    pub fn to_rgb(&self, depth: u8) -> [u8; 3] {
+    pub fn to_rgb(&self) -> [u8; 3] {
         let c = self.val * self.sat;
         let h = self.hue / 60.0;
         let x = c * (1.0 - (h % 2.0 - 1.0).abs());
@@ -48,7 +48,7 @@ impl HSVColor {
             _ => unreachable!()
         };
 
-        let n = ((1 << depth) - 1) as f32;
+        let n = u8::MAX as f32;
         let r = ((r1 + m) * n) as u8;
         let g = ((g1 + m) * n) as u8;
         let b = ((b1 + m) * n) as u8;
