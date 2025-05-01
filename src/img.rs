@@ -12,36 +12,48 @@ pub fn read_image_rgb8(path: PathBuf) -> (u32, u32, Vec<u8>) {
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().expect("Image info failed to read");
     let mut buf = vec![0; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).expect("Image data failed to read");
+    reader.next_frame(&mut buf).expect("Image data failed to read");
+    let info = reader.info();
     let samples = info.color_type.samples();
 
-    let x = |b: u8, f: u8, a: u8| {
+    let x = |b: u16, f: u8, a: u8| {
         let a = a as u16;
         let max = u8::MAX as u16;
         let f = f as u16 * a / max;
-        let b = b as u16 * (max - a) / max;
+        let b = b * (max - a) / max;
         (f + b) as u8
     };
 
-    let bkgd = [0, 0, 0];
-
-    (info.width, info.height, buf.chunks_exact(samples).flat_map(|s|
-        match s.len() {
-            1 => [s[0], s[0], s[0]],
-            2 => {
-                let g = x(0, s[0], s[1]);
-                [g, g, g]
-            },
-            3 => [s[0], s[1], s[2]],
-            4 => {
-                let r = x(bkgd[0], s[0], s[3]);
-                let g = x(bkgd[1], s[1], s[3]);
-                let b = x(bkgd[2], s[2], s[3]);
-                [r, g, b]
-            },
-            _ => panic!("Unexpected sample size"),
+    
+    let bkgd = if let Some(bkgd) = &info.bkgd {
+        match info.color_type {
+            png::ColorType::Indexed => unimplemented!(),
+            _ => {
+                bkgd.chunks_exact(2).map(|chunk|
+                    u16::from_be_bytes(chunk.try_into().unwrap())
+                ).collect()
+            }
         }
-    ).collect())
+    } else {
+        vec![0, 0, 0]
+    };
+
+    let pixels = buf.chunks_exact(samples);
+
+    (info.width, info.height, match samples {
+        1 => pixels.flat_map(|s| [s[0], s[0], s[0]]).collect(),
+        2 => pixels.flat_map(|s| {
+            let g = x(bkgd[0], s[0], s[1]);
+            [g, g, g]
+        }).collect(),
+        3 => pixels.flat_map(|s| [s[0], s[1], s[2]]).collect(),
+        4 => pixels.flat_map(|s| {
+            [x(bkgd[0], s[0], s[3]),
+             x(bkgd[1], s[1], s[3]),
+             x(bkgd[2], s[2], s[3])]
+        }).collect(),
+        _ => panic!("Unexpected sample size"),
+    })
 }
 
 pub fn stretch(buf: &mut [u8]) {
