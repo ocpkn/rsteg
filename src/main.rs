@@ -18,27 +18,38 @@ struct Args {
     output: PathBuf,
 
     #[arg(short, long,
+        help("Reveal a concealed image"),
+        long_help("Reveal an image concealed in the image data of the input image"),
         group="mode",
         requires("bits"))]
     reveal: bool,
 
     #[arg(short, long,
+        help("Conceal the input image"),
+        long_help("Conceal the input image within the specified image of the same dimensions"),
         group="mode",
         requires("bits"))]
     conceal: Option<PathBuf>,
 
-    #[arg(short, long, value_name="KEY")]
+    #[arg(short, long, value_name="KEY",
+        help("Encrypt the input image"),
+        long_help("Encrypt the input image data with the 64-bit key number"))]
     key: Option<u64>,
 
-    #[arg(short, long, value_name="1-8", value_parser=clap::value_parser!(u8).range(1..9),
+    #[arg(short, long,
+        help("How many bits to use"),
+        long_help("How many least significant color value bits to use for steganography"),
+        value_name="1-8", value_parser=clap::value_parser!(u8).range(1..9),
         default_value("8"))]
     bits: u8,
 
-    #[arg(short, long,
+    #[arg(short, long, help("Normalize using contrast stretching"),
+        long_help("Normalize the input image using global contrast stretching"),
         conflicts_with_all(["equalize", "reveal"]))]
     stretch: bool,
 
-    #[arg(short, long,
+    #[arg(short, long, help("Normalize using histogram equalization"),
+        long_help("Normalize the input image using HSV histogram equalization"),
         conflicts_with_all(["reveal"]))]
     equalize: bool,
 }
